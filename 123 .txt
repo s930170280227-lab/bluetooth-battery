@@ -1,0 +1,221 @@
+# coding=utf-8
+import subprocess
+import json
+import re
+import time
+import threading
+from functools import partial
+import pystray
+from PIL import Image, ImageDraw
+import os
+from typing import Dict, Any, List, Set, Tuple
+
+# === 新增：Windows 平台隱藏視窗所需的標誌 ===
+try:
+    CREATE_NO_WINDOW = subprocess.CREATE_NO_WINDOW
+except AttributeError:
+    # 在非 Windows 系統上不使用此標誌
+    CREATE_NO_WINDOW = 0
+# =======================================
+
+# --- 全域設定 (保持不變) ---
+DEVICE_RULES: Dict[str, str] = {
+    "T88-BT1": "{104EA319-6EE2-4701-BD47-8DDBF425BBE5} 2",
+    "KATAR PRO Wireless": "{104EA319-6EE2-4701-BD47-8DDBF425BBE5} 2",
+    "振宇 的 Buds2 Pro": "{670245F9-6E25-4179-85C1-981C33B9D3B7} 4",
+    "MediaTek Bluetooth Adapter": "{A92F26CA-EDA7-4B1D-9DB2-27B68AA5A2EB} 2",
+}
+
+SAVE_FILE: str = "selected_devices.json"
+
+PS_CMD: str = r"""
+$devs = Get-PnpDevice -Class Bluetooth | Where-Object { $_.Status -eq "OK" }
+$result = @()
+foreach ($d in $devs) {
+    $props = Get-PnpDeviceProperty -InstanceId $d.InstanceId | Select-Object KeyName,Data,Type
+    $result += [PSCustomObject]@{
+        Name = $d.FriendlyName
+        InstanceId = $d.InstanceId
+        Props = $props
+    }
+}
+$result | ConvertTo-Json -Depth 6
+"""
+
+def probe_all_battery() -> Dict[str, Any]:
+    """呼叫 PowerShell 抓取藍牙裝置電量，並隱藏視窗"""
+    try:
+        cp = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", PS_CMD],
+            capture_output=True, 
+            text=True, 
+            timeout=20,
+            # === 新增的關鍵參數：隱藏 PowerShell 視窗 ===
+            creationflags=CREATE_NO_WINDOW
+            # =======================================
+        )
+        if cp.returncode != 0 or not cp.stdout.strip():
+            return {}
+
+        devices = json.loads(cp.stdout)
+        if isinstance(devices, dict):
+            devices = [devices]
+
+        results: Dict[str, Any] = {}
+        for dev in devices:
+            name = dev.get("Name") or "(未知裝置)"
+            props = dev.get("Props") or []
+            batts: List[Tuple[str, Any]] = []
+
+            for p in props:
+                key = p.get("KeyName") or ""
+                val = p.get("Data")
+
+                if re.search(r"battery|percent|percentage", key, re.I):
+                    batts.append((key, val))
+                elif isinstance(val, int) and 0 <= val <= 100:
+                    batts.append((key, val))
+
+            if name in DEVICE_RULES:
+                chosen_key = DEVICE_RULES[name]
+                for k, v in batts:
+                    if k == chosen_key:
+                        results[name] = v
+                        break
+            elif batts:
+                results[name] = batts[0][1]
+
+        return results
+    except Exception:
+        return {}
+
+
+def create_icon(percent: int = 100) -> Image.Image:
+    """極簡工具列圖示生成函式：只顯示顏色和填充比例，不顯示數字。(保持不變)"""
+    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+
+    # 電池外觀
+    d.rectangle([10, 15, 54, 55], outline=(180, 180, 180), width=3)
+    d.rectangle([26, 8, 38, 15], fill=(180, 180, 180))
+
+    # 填充顏色
+    if percent > 60:
+        fill_color = (0, 200, 0)   # 綠色
+    elif percent > 30:
+        fill_color = (255, 200, 0) # 黃色
+    else:
+        fill_color = (200, 0, 0)   # 紅色
+
+    # 繪製填充電量
+    max_height = 40
+    fill_height = int((percent / 100) * max_height)
+    y0 = 55 - fill_height
+    y1 = 55
+
+    if y0 < y1:
+        d.rectangle([13, y0, 51, y1], fill=fill_color)
+    
+    return img
+
+# --- 應用程式類別 (保持不變) ---
+
+class TrayApp:
+    def __init__(self):
+        self.icon = pystray.Icon("BT Battery", create_icon(0), "BT Battery Monitor")
+        self.battery: Dict[str, Any] = {}
+        self.stop_event = threading.Event()
+        self.selected_devices: Set[str] = self.load_selected_devices()
+        self.menu_needs_update: bool = False
+        self.last_battery_state: Dict[str, Any] = {}
+
+    def load_selected_devices(self) -> Set[str]:
+        if os.path.exists(SAVE_FILE):
+            try:
+                with open(SAVE_FILE, "r", encoding="utf-8") as f:
+                    return set(json.load(f))
+            except Exception:
+                return set()
+        return set()
+
+    def save_selected_devices(self):
+        try:
+            with open(SAVE_FILE, "w", encoding="utf-8") as f:
+                json.dump(list(self.selected_devices), f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"[!] 無法儲存裝置清單: {e}")
+
+    def toggle_device(self, name: str, icon=None, item=None):
+        if name in self.selected_devices:
+            self.selected_devices.remove(name)
+        else:
+            self.selected_devices.add(name)
+        
+        self.menu_needs_update = True 
+        self.icon.menu = self.build_menu()
+
+    def build_menu(self) -> pystray.Menu:
+        device_items = [
+            pystray.MenuItem(
+                f"{k}: {v}%" if v is not None else f"{k}: N/A", None
+            ) for k, v in self.battery.items() if k in self.selected_devices
+        ]
+
+        settings_items = [
+            pystray.MenuItem(
+                k,
+                partial(self.toggle_device, k),
+                checked=lambda item, dev=k: dev in self.selected_devices
+            )
+            for k in self.battery.keys()
+        ]
+
+        return pystray.Menu(
+            *device_items,
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("設定 - 顯示裝置", pystray.Menu(*settings_items)),
+            pystray.MenuItem("Exit", self.stop, default=True)
+        )
+
+    def update_status(self):
+        first = True
+        while not self.stop_event.is_set():
+            old_battery = self.battery.copy()
+            self.battery = probe_all_battery()
+            
+            if self.battery.keys() != old_battery.keys():
+                self.menu_needs_update = True
+            
+            visible_battery = {k: v for k, v in self.battery.items() if k in self.selected_devices and v is not None}
+            
+            avg = 0
+            if visible_battery:
+                avg = sum(visible_battery.values()) // len(visible_battery)
+                self.icon.icon = create_icon(avg)
+                self.icon.title = f"平均電量 {avg}%" 
+            else:
+                self.icon.icon = create_icon(0)
+                self.icon.title = "No Devices"
+            
+            if self.menu_needs_update:
+                self.icon.menu = self.build_menu()
+                self.menu_needs_update = False
+
+            if first:
+                first = False
+                self.stop_event.wait(1)
+            else:
+                self.stop_event.wait(60)
+
+    def stop(self, icon=None, item=None):
+        self.save_selected_devices()
+        self.stop_event.set()
+        threading.Thread(target=self.icon.stop).start()
+
+    def run(self):
+        threading.Thread(target=self.update_status, daemon=True).start()
+        self.icon.run()
+
+if __name__ == "__main__":
+    app = TrayApp()
+    app.run()
