@@ -3,6 +3,7 @@
 選擇要顯示電量的設備後，會生成一個.json檔案紀錄選擇設備，下次啟動應用便會自動選擇。
 安裝需求：Windows 10/11
 dist資料夾裡包含了啟動的應用，123.txt為應用的原始碼，歡迎使用以及自行編輯。
+已發布v1更新，修正右鍵icon會關閉的bug
 
 
 A simple application for easily monitoring the battery level of Bluetooth devices from the system tray.
